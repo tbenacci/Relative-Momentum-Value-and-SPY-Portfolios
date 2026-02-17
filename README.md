@@ -1,0 +1,1 @@
+This .Rmd file examines 252-day U.S. stock momentum relative to 252-day SPY momentum factor and a relative book-to-market factor. After calculating these and filtering the universe to be the top 500 stocks by market cap close the day of the signal, 1-week portfolios are created and compared.
