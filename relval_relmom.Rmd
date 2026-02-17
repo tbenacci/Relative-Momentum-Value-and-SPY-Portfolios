@@ -1,0 +1,468 @@
+---
+title: "Relative Value & Relative Momentum"
+author: "Thomas Benacci"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Configuration
+
+```{r}
+OUTPUT_DIR      <- "F:/RelativeValueAndMomentum"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Load Data
+
+```{r}
+library(data.table)
+library(lubridate)
+library(ggplot2)
+
+# Daily prices  
+daily <- fread("F:/SecurityTracking/unified_prices.csv")
+daily <- daily[exchg %in% c(11L, 12L, 14L) & datadate >= "2005-01-01" & !is.na(cik)]
+daily[, datadate := as.Date(datadate)]
+setorder(daily, cik, tic, datadate)
+daily <- daily[!is.na(aprccd)]
+daily[is.na(aprcod), aprcod := shift(aprccd, 1L, type = "lag"), by = .(cik, tic)]
+daily <- daily[!is.na(aprcod) & !is.na(mktval)]
+
+# SPY  
+spy <- fread("F:/merged_data/SPY.csv")
+spy[, datadate := as.Date(date)]
+spy[, ajexdi := Close / Adjusted]
+spy[, spy_aprccd := Adjusted]
+spy[, spy_aprcod := Open / ajexdi]
+spy[, spy_close_price := Close] # unadjusted close for price-return benchmark
+setorder(spy, datadate)
+spy[, spy_mom12mo := spy_aprccd / shift(spy_aprccd, 252L) - 1]
+spy <- spy[, .(datadate, spy_aprccd, spy_aprcod, spy_mom12mo, spy_close_price)]
+
+# Fundamentals  
+fund <- fread("F:/LostInStandardization/output/fundamentals_combined.csv")
+fund <- fund[fyearq >= 1999 & !is.na(cik) & curcdq == "USD"]
+
+fund[is.na(pstkq), pstkq := 0]
+fund[, book_equity := fcase(
+  !is.na(ceqq), ceqq - pstkq,
+  !is.na(seqq), seqq - pstkq,
+  default = NA_real_
+)]
+fund <- fund[!is.na(book_equity) & book_equity > 0]
+
+fund[, rdq := as.Date(rdq)]
+fund[, fqtr_end := as.Date(paste0(fyearq, "-", fqtr * 3L, "-01")) + months(1L) - 1L]
+fund[is.na(rdq) & fqtr == 4L, rdq := fqtr_end + 75L]
+fund[is.na(rdq),               rdq := fqtr_end + 45L]
+
+fund_bm <- fund[, .(cik, rdq, book_equity)]
+setorder(fund_bm, cik, rdq)
+fund_bm <- fund_bm[, .SD[.N], by = .(cik, rdq)]
+```
+
+# Merge
+
+```{r}
+spy_daily <- copy(spy) # keep clean copy for buy-and-hold benchmark later
+
+daily <- daily[, .(datadate, tic, cik, aprccd, aprcod, mktval)]
+daily <- merge(daily, spy, by = "datadate", all.x = TRUE)
+rm(spy, fund)
+
+# rolling join: last known book_equity as of each trading day
+setkey(fund_bm, cik, rdq)
+setkey(daily, cik, datadate)
+daily <- fund_bm[daily, roll = TRUE]
+setnames(daily, "rdq", "datadate")
+
+# B/M (book_equity in millions, mktval in raw dollars)
+# only assign bm where both cik and tic identify a unique security
+daily[, bm := fifelse(!is.na(cik) & !is.na(tic) & !is.na(book_equity),
+                       book_equity / (mktval / 1e6),
+                       NA_real_)]
+rm(fund_bm)
+```
+
+# Feature Construction
+
+```{r}
+setorder(daily, cik, tic, datadate)
+
+# Relative momentum  
+daily[, char_mom12m    := aprccd / shift(aprccd, 252L) - 1, by = .(cik, tic)]
+daily[, char_relmom12m := char_mom12m / spy_mom12mo - 1]
+
+# Relative B/M  
+# universe-level mktval-weighted B/M each day, then stock / universe - 1
+daily[, univ_bm := weighted.mean(bm, mktval, na.rm = TRUE), by = datadate]
+daily[, char_relbm := bm / univ_bm - 1]
+```
+
+# Coverage Check
+
+```{r}
+cat(sprintf("Daily rows: %s\n", format(nrow(daily), big.mark = ",")))
+cat(sprintf("Date range: %s to %s\n", min(daily$datadate), max(daily$datadate)))
+cat(sprintf("\nFeature coverage:\n"))
+cat(sprintf("  bm:              %.1f%%\n", mean(!is.na(daily$bm)) * 100))
+cat(sprintf("  char_relbm:      %.1f%%\n", mean(!is.na(daily$char_relbm)) * 100))
+cat(sprintf("  char_mom12m:     %.1f%%\n", mean(!is.na(daily$char_mom12m)) * 100))
+cat(sprintf("  char_relmom12m:  %.1f%%\n", mean(!is.na(daily$char_relmom12m)) * 100))
+
+# coverage over time (yearly)
+cov_yr <- daily[, .(bm_cov      = mean(!is.na(bm)),
+                     relbm_cov   = mean(!is.na(char_relbm)),
+                     relmom_cov  = mean(!is.na(char_relmom12m))),
+                by = year(datadate)]
+print(cov_yr)
+```
+
+# Week Structure + Forward Return
+
+```{r}
+wday_map <- c(NA_integer_, 3L, 4L, 5L, 1L, 2L, NA_integer_)
+daily[, day_int := wday_map[wday(datadate)]]
+
+daily[, orig_wk := as.integer(paste0(
+  format(datadate - (as.numeric(format(datadate, "%u")) - 4L), "%Y"),
+  format(datadate - (as.numeric(format(datadate, "%u")) - 4L), "%V")
+))]
+wk_order <- sort(unique(daily$orig_wk))
+nxt_wk <- setNames(c(wk_order[-1], NA_integer_), wk_order)
+daily[, week_id := fifelse(day_int %in% c(1L, 2L), nxt_wk[as.character(orig_wk)], orig_wk)]
+daily[, orig_wk := NULL]
+
+daily[, cur_buy  := aprcod[which.min(day_int)], by = .(cik, tic, week_id)]
+daily[, cur_sell := aprccd[which.max(day_int)], by = .(cik, tic, week_id)]
+week_prices <- unique(daily[, .(cik, tic, week_id, cur_buy, cur_sell)])
+daily[, next_week_id := nxt_wk[as.character(week_id)]]
+daily <- merge(daily,
+               week_prices[, .(cik, tic, week_id, buy_price = cur_buy, sell_price = cur_sell)],
+               by.x = c("cik", "tic", "next_week_id"),
+               by.y = c("cik", "tic", "week_id"),
+               all.x = TRUE)
+daily[, c("cur_buy", "cur_sell") := NULL]
+
+daily[is.na(buy_price),  buy_price  := aprccd]
+daily[is.na(sell_price), sell_price := aprccd]
+daily[, weekly_ret := sell_price / buy_price - 1]
+
+spy_wk <- unique(daily[, .(week_id, spy_cur_buy = spy_aprcod[which.min(day_int)],
+                            spy_cur_sell = spy_aprccd[which.max(day_int)]), by = week_id])
+daily <- merge(daily,
+               spy_wk[, .(week_id, spy_buy = spy_cur_buy, spy_sell = spy_cur_sell)],
+               by.x = "next_week_id", by.y = "week_id", all.x = TRUE)
+daily[, spy_weekly_ret := spy_sell / spy_buy - 1]
+```
+
+# Wednesday Filter + Top 500
+
+```{r}
+standardize <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+wed_all <- daily[day_int == 5L & !is.na(mktval) & (!is.na(char_relmom12m) | !is.na(char_relbm))]
+setorder(wed_all, datadate, -mktval)
+wed_all <- wed_all[, .SD[1:min(.N, 500L)], by = datadate]
+```
+
+# Live Signal
+
+```{r}
+PTILE_THRESHOLD <- 0.95 # threshold of signal strength to consider for portfolio creation
+W_RELMOM        <- 0.7 # weight on RelMom (RelBM gets 1 - W_RELMOM)
+W_RELMOM_SPY    <- 0.7 # weight on RelMom in RelMom/SPY blend (SPY gets 1 - W_RELMOM_SPY)
+```
+
+```{r}
+latest_wed <- max(wed_all$datadate)
+signal <- wed_all[datadate == latest_wed]
+signal[, char_relmom12m := standardize(char_relmom12m)]
+signal[, char_relbm     := standardize(char_relbm)]
+setorder(signal, -char_relmom12m)
+
+cat(sprintf("Signal date (Wednesday): %s\n", latest_wed))
+cat(sprintf("Buy date (Thursday):     %s\n", latest_wed + 1L))
+cat(sprintf("Universe: %s stocks\n", nrow(signal)))
+cat(sprintf("  char_relmom12m non-NA: %s\n", sum(!is.na(signal$char_relmom12m))))
+cat(sprintf("  char_relbm non-NA:     %s\n", sum(!is.na(signal$char_relbm))))
+cat(sprintf("Threshold: top %s%%\n\n", round((1 - PTILE_THRESHOLD) * 100)))
+
+fwrite(signal[, .(datadate, cik, tic, mktval, char_relmom12m, char_relbm)],
+       file.path(OUTPUT_DIR, "live_universe.csv"))
+
+# relmom picks
+cut_mom <- quantile(signal$char_relmom12m, PTILE_THRESHOLD, na.rm = TRUE)
+picks_mom <- signal[char_relmom12m >= cut_mom, .(datadate, cik, tic, mktval, char_relmom12m, char_relbm)]
+setorder(picks_mom, -char_relmom12m)
+cat(sprintf("RelMom picks: %s stocks\n", nrow(picks_mom)))
+print(picks_mom)
+
+# relbm picks
+cut_bm <- quantile(signal$char_relbm, PTILE_THRESHOLD, na.rm = TRUE)
+picks_bm <- signal[char_relbm >= cut_bm, .(datadate, cik, tic, mktval, char_relmom12m, char_relbm)]
+setorder(picks_bm, -char_relbm)
+cat(sprintf("\nRelBM picks: %s stocks\n", nrow(picks_bm)))
+print(picks_bm)
+
+fwrite(picks_mom, file.path(OUTPUT_DIR, "live_picks_relmom.csv"))
+fwrite(picks_bm,  file.path(OUTPUT_DIR, "live_picks_relbm.csv"))
+cat(sprintf("\nSaved to %s\n", OUTPUT_DIR))
+```
+
+# Historical Sample
+
+```{r}
+wed <- wed_all[!is.na(weekly_ret) & !is.na(spy_weekly_ret)]
+wed <- wed[datadate >= as.Date("2009-01-01")]
+wed[, char_relmom12m := standardize(char_relmom12m), by = datadate]
+wed[, char_relbm     := standardize(char_relbm),     by = datadate]
+wed[, target := as.integer(weekly_ret > spy_weekly_ret)]
+
+out <- wed[!is.na(target), .(datadate, cik, tic, mktval, weekly_ret, spy_weekly_ret,
+                              char_relmom12m, char_relbm, target)]
+
+cat(sprintf("Sample: %s rows | %s to %s\n",
+            format(nrow(out), big.mark = ","), min(out$datadate), max(out$datadate)))
+cat(sprintf("char_relmom12m non-NA: %s (%.1f%%)\n",
+            format(sum(!is.na(out$char_relmom12m)), big.mark = ","),
+            mean(!is.na(out$char_relmom12m)) * 100))
+cat(sprintf("char_relbm non-NA:     %s (%.1f%%)\n",
+            format(sum(!is.na(out$char_relbm)), big.mark = ","),
+            mean(!is.na(out$char_relbm)) * 100))
+cat(sprintf("Signal correlation: %.4f\n",
+            cor(out$char_relmom12m, out$char_relbm, use = "complete.obs")))
+```
+
+# Sanity Checks & Portfolio Construction
+
+The sanity check plots and portfolio statistics are computed from the same data to guarantee consistency. Each signal's top percentile portfolio is constructed on its own non-NA subset independently.
+
+```{r}
+port_stats <- function(r, name) {
+  r <- r[!is.na(r)]
+  ann_ret  <- mean(r) * 52
+  ann_vol  <- sd(r) * sqrt(52)
+  sharpe   <- ann_ret / ann_vol
+  cum      <- cumprod(1 + r)
+  max_dd   <- min((cum - cummax(cum)) / cummax(cum))
+  win_rate <- mean(r > 0)
+  total    <- tail(cum, 1)
+  data.table(Portfolio = name, Ann_Ret = ann_ret, Ann_Vol = ann_vol, Sharpe = sharpe,
+             Max_DD = max_dd, Win_Rate = win_rate, Total_Growth = total)
+}
+
+#  Build portfolio returns: each signal on its own non-NA subset  
+ret_mom <- out[!is.na(char_relmom12m), {
+  cut_val <- quantile(char_relmom12m, PTILE_THRESHOLD, na.rm = TRUE)
+  top     <- .SD[char_relmom12m >= cut_val]
+  rest    <- .SD[char_relmom12m <  cut_val]
+  list(ew_relmom      = if (nrow(top) > 0) mean(top$weekly_ret) else 0,
+       ew_relmom_rest = if (nrow(rest) > 0) mean(rest$weekly_ret) else 0)
+}, by = datadate]
+
+ret_bm <- out[!is.na(char_relbm), {
+  cut_val <- quantile(char_relbm, PTILE_THRESHOLD, na.rm = TRUE)
+  top     <- .SD[char_relbm >= cut_val]
+  rest    <- .SD[char_relbm <  cut_val]
+  list(ew_relbm      = if (nrow(top) > 0) mean(top$weekly_ret) else 0,
+       ew_relbm_rest = if (nrow(rest) > 0) mean(rest$weekly_ret) else 0)
+}, by = datadate]
+
+ret_univ <- out[, .(ew_univ = mean(weekly_ret)), by = datadate]
+
+port_ret <- merge(ret_mom, ret_bm, by = "datadate", all = TRUE)
+port_ret <- merge(port_ret, ret_univ, by = "datadate", all = TRUE)
+setorder(port_ret, datadate)
+
+port_ret[, ew_blend := W_RELMOM * ew_relmom + (1 - W_RELMOM) * ew_relbm]
+blend_lbl <- sprintf("%.0f/%.0f Blend", W_RELMOM * 100, (1 - W_RELMOM) * 100)
+
+# SPY buy-and-hold: use unadjusted Close (price return only)
+spy_bh <- spy_daily[datadate >= min(port_ret$datadate) & datadate <= max(port_ret$datadate)]
+setorder(spy_bh, datadate)
+setkey(spy_bh, datadate)
+spy_matched <- spy_bh[.(port_ret$datadate), roll = TRUE]
+spy_matched[, spy_ret := spy_close_price / shift(spy_close_price) - 1]
+port_ret[, spy_ret := spy_matched$spy_ret]
+port_ret <- port_ret[!is.na(spy_ret)]
+
+# RelMom + SPY blend: split allocation between active RelMom picks and passive SPY
+port_ret[, ew_relmom_spy := W_RELMOM_SPY * ew_relmom + (1 - W_RELMOM_SPY) * spy_ret]
+relmom_spy_lbl <- sprintf("%.0f/%.0f RelMom/SPY", W_RELMOM_SPY * 100, (1 - W_RELMOM_SPY) * 100)
+
+# cumulative returns
+port_ret[, ew_relmom_cum      := cumprod(1 + ew_relmom)]
+port_ret[, ew_relmom_rest_cum := cumprod(1 + ew_relmom_rest)]
+port_ret[, ew_relbm_cum       := cumprod(1 + ew_relbm)]
+port_ret[, ew_relbm_rest_cum  := cumprod(1 + ew_relbm_rest)]
+port_ret[, ew_blend_cum       := cumprod(1 + ew_blend)]
+port_ret[, ew_univ_cum        := cumprod(1 + ew_univ)]
+port_ret[, spy_cum            := cumprod(1 + spy_ret)]
+port_ret[, ew_relmom_spy_cum := cumprod(1 + ew_relmom_spy)]
+
+cat(sprintf("SPY sanity check: %.1fx over %s to %s\n",
+            tail(port_ret$spy_cum, 1), min(port_ret$datadate), max(port_ret$datadate)))
+
+pct_lbl <- round((1 - PTILE_THRESHOLD) * 100)
+lbl_top <- paste0("Top ", pct_lbl, "%")
+```
+
+## Sanity Check: char_relmom12m
+
+```{r}
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = ew_relmom_cum,      color = lbl_top), linewidth = 1) +
+  geom_line(aes(y = ew_relmom_rest_cum, color = "Rest"),  linewidth = 0.8) +
+  scale_color_manual(values = setNames(c("steelblue", "gray50"), c(lbl_top, "Rest"))) +
+  labs(title = "char_relmom12m: Cumulative Return", x = "Date", y = "Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = log(ew_relmom_cum),      color = lbl_top), linewidth = 1) +
+  geom_line(aes(y = log(ew_relmom_rest_cum), color = "Rest"),  linewidth = 0.8) +
+  scale_color_manual(values = setNames(c("steelblue", "gray50"), c(lbl_top, "Rest"))) +
+  labs(title = "char_relmom12m: Log Cumulative Return", x = "Date", y = "Log Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+```
+
+## Sanity Check: char_relbm
+
+```{r}
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = ew_relbm_cum,      color = lbl_top), linewidth = 1) +
+  geom_line(aes(y = ew_relbm_rest_cum, color = "Rest"),  linewidth = 0.8) +
+  scale_color_manual(values = setNames(c("steelblue", "gray50"), c(lbl_top, "Rest"))) +
+  labs(title = "char_relbm: Cumulative Return", x = "Date", y = "Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = log(ew_relbm_cum),      color = lbl_top), linewidth = 1) +
+  geom_line(aes(y = log(ew_relbm_rest_cum), color = "Rest"),  linewidth = 0.8) +
+  scale_color_manual(values = setNames(c("steelblue", "gray50"), c(lbl_top, "Rest"))) +
+  labs(title = "char_relbm: Log Cumulative Return", x = "Date", y = "Log Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+```
+
+## Portfolio Statistics
+
+```{r}
+stats <- rbindlist(list(
+  port_stats(port_ret$ew_relmom, sprintf("RelMom Top %s%%", pct_lbl)),
+  port_stats(port_ret$ew_relbm,  sprintf("RelBM Top %s%%",  pct_lbl)),
+  port_stats(port_ret$ew_blend,  sprintf("%s Top %s%%", blend_lbl, pct_lbl)),
+  port_stats(port_ret$ew_relmom_spy, sprintf("%s Top %s%%", relmom_spy_lbl, pct_lbl)),
+  port_stats(port_ret$ew_univ,   "Universe EW"),
+  port_stats(port_ret$spy_ret,   "SPY (Buy & Hold)")
+))
+
+stats[, Ann_Ret      := sprintf("%.1f%%", Ann_Ret * 100)]
+stats[, Ann_Vol      := sprintf("%.1f%%", Ann_Vol * 100)]
+stats[, Sharpe       := sprintf("%.2f",   as.numeric(Sharpe))]
+stats[, Max_DD       := sprintf("%.1f%%", as.numeric(Max_DD) * 100)]
+stats[, Win_Rate     := sprintf("%.1f%%", as.numeric(Win_Rate) * 100)]
+stats[, Total_Growth := sprintf("%.1fx",  as.numeric(Total_Growth))]
+print(stats)
+```
+
+# RelMom v. RelBM Comparison
+
+Value and momentum are negatively correlated (Asness, Moskowitz, Pedersen 2013). A blend should diversify across both risk premiums. 
+
+```{r}
+cols <- c("RelMom" = "steelblue", "RelBM" = "darkorange",
+          "Blend" = "purple", "RelMom/SPY" = "darkgreen", "Universe" = "gray50")
+
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = ew_relmom_cum,     color = "RelMom"),     linewidth = 1) +
+  geom_line(aes(y = ew_relbm_cum,      color = "RelBM"),      linewidth = 1) +
+  geom_line(aes(y = ew_blend_cum,      color = "Blend"),       linewidth = 1) +
+  geom_line(aes(y = ew_relmom_spy_cum, color = "RelMom/SPY"), linewidth = 1) +
+  geom_line(aes(y = ew_univ_cum,       color = "Universe"),    linewidth = 1) +
+  scale_color_manual(values = cols) +
+  labs(title = sprintf("Top %s%%: Portfolio Comparison", pct_lbl),
+       x = "Date", y = "Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+
+ggplot(port_ret, aes(x = datadate)) +
+  geom_line(aes(y = log(ew_relmom_cum),     color = "RelMom"),     linewidth = 1) +
+  geom_line(aes(y = log(ew_relbm_cum),      color = "RelBM"),      linewidth = 1) +
+  geom_line(aes(y = log(ew_blend_cum),      color = "Blend"),       linewidth = 1) +
+  geom_line(aes(y = log(ew_relmom_spy_cum), color = "RelMom/SPY"), linewidth = 1) +
+  geom_line(aes(y = log(ew_univ_cum),       color = "Universe"),    linewidth = 1) +
+  scale_color_manual(values = cols) +
+  labs(title = sprintf("Top %s%%: Portfolio Comparison (Log)", pct_lbl),
+       x = "Date", y = "Log Growth of $1", color = NULL) +
+  theme_minimal() + theme(legend.position = "top")
+```
+
+```{r}
+print_ttest <- function(x, y, label_x, label_y) {
+  d <- x - y
+  d <- d[!is.na(d)]
+  tt <- t.test(d)
+  cat(sprintf("\n%s v. %s:\n", label_x, label_y))
+  cat(sprintf("  Mean weekly diff: %.2f bps\n", mean(d) * 1e4))
+  cat(sprintf("  t-stat: %.2f | p-value: %.4f\n", tt$statistic, tt$p.value))
+  cat(sprintf("  95%% CI: [%.2f, %.2f] bps\n", tt$conf.int[1] * 1e4, tt$conf.int[2] * 1e4))
+  cat(sprintf("  Annualized diff: %.1f%%\n", mean(d) * 52 * 100))
+}
+
+lbl_mom      <- sprintf("RelMom Top %s%%", pct_lbl)
+lbl_bm       <- sprintf("RelBM Top %s%%",  pct_lbl)
+lbl_blend    <- sprintf("%s Top %s%%", blend_lbl, pct_lbl)
+lbl_mom_spy  <- sprintf("%s Top %s%%", relmom_spy_lbl, pct_lbl)
+lbl_univ     <- "Universe EW"
+lbl_spy      <- "SPY (Buy & Hold)"
+
+cat("═══ Portfolio v. SPY (Buy & Hold) ═══\n")
+print_ttest(port_ret$ew_relmom,     port_ret$spy_ret, lbl_mom,     lbl_spy)
+print_ttest(port_ret$ew_relbm,      port_ret$spy_ret, lbl_bm,      lbl_spy)
+print_ttest(port_ret$ew_blend,      port_ret$spy_ret, lbl_blend,   lbl_spy)
+print_ttest(port_ret$ew_relmom_spy, port_ret$spy_ret, lbl_mom_spy, lbl_spy)
+print_ttest(port_ret$ew_univ,       port_ret$spy_ret, lbl_univ,    lbl_spy)
+
+cat("\n═══ Head-to-Head ═══\n")
+print_ttest(port_ret$ew_relmom,     port_ret$ew_relbm,      lbl_mom,     lbl_bm)
+print_ttest(port_ret$ew_relmom,     port_ret$ew_univ,       lbl_mom,     lbl_univ)
+print_ttest(port_ret$ew_relbm,      port_ret$ew_univ,       lbl_bm,      lbl_univ)
+print_ttest(port_ret$ew_blend,      port_ret$ew_univ,       lbl_blend,   lbl_univ)
+print_ttest(port_ret$ew_blend,      port_ret$ew_relmom,     lbl_blend,   lbl_mom)
+print_ttest(port_ret$ew_relmom_spy, port_ret$ew_relmom,     lbl_mom_spy, lbl_mom)
+print_ttest(port_ret$ew_relmom_spy, port_ret$ew_univ,       lbl_mom_spy, lbl_univ)
+
+cat("\n═══ Weekly Return Correlations ═══\n")
+cor_pairs <- list(
+  c("ew_relmom", "ew_relbm",      lbl_mom, lbl_bm),
+  c("ew_relmom", "spy_ret",       lbl_mom, lbl_spy),
+  c("ew_relbm",  "spy_ret",       lbl_bm,  lbl_spy),
+  c("ew_blend",  "spy_ret",       lbl_blend, lbl_spy),
+  c("ew_relmom_spy", "spy_ret",   lbl_mom_spy, lbl_spy),
+  c("ew_relmom_spy", "ew_relmom", lbl_mom_spy, lbl_mom),
+  c("ew_univ",   "spy_ret",       lbl_univ, lbl_spy)
+)
+for (p in cor_pairs) {
+  cat(sprintf("  %-45s %.4f\n", paste(p[3], "v.", p[4]),
+              cor(port_ret[[p[1]]], port_ret[[p[2]]], use = "complete.obs")))
+}
+```
+
+# Save
+
+```{r}
+fwrite(out, file.path(OUTPUT_DIR, "valmo_features.csv"))
+cat(sprintf("Saved to %s/valmo_features.csv\n", OUTPUT_DIR))
+```
